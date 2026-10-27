@@ -1,0 +1,402 @@
+# Full access runs tools on the host with the current user's permissions.
+mode = "full"
+state_dir = "~/.local/share/lillia-full"
+# Load and verify the configured parent, worker, and embedder before accepting work.
+# The gateway owns the processes; this does not enable a boot service or keepalive.
+startup_models = true
+startup_timeout_seconds = 1800
+max_steps = 0
+max_consecutive_tool_failures = 0
+# Retry a completed generation that contains only reasoning or whitespace, with no answer/tools.
+# Consecutive failures are bounded; a usable response restores this allowance. Zero disables retries.
+empty_response_retries = 2
+# Consecutive retries of a generation that ended without any action: it reached the output limit while
+# still reasoning or answering, or its reasoning degenerated into repetition / raw hex enumeration.
+# Reasoning that genuinely overran the limit is condensed into working notes for the retry, so the
+# thinking carries forward instead of being lost; a degenerate stream is aborted within minutes and
+# retried with anti-repetition sampling. Thinking itself is never capped by these retries
+# (reasoning_budget_tokens stays -1). Library default 1; each attempt costs about an hour on the
+# three-P100 profile, so three is the ceiling here. Zero disables retries.
+length_retries = 3
+# Zero disables generation/turn deadlines for slow hardware.
+max_turn_seconds = 0
+# Character ceiling; the model context window also reserves room for generation. With the
+# 250000-token windows below, the window gives (250000 - 64000 - 2048) * 3 = 551856 input characters
+# per step. This remains the ceiling for children and summary ingestion; [cloud] keeps 250000.
+max_context_chars = 552000
+# Parent working context, including tools and messages. Compact within this smaller budget
+# instead of filling the server window with source reads. Zero restores the shared
+# max_context_chars ceiling. This also applies to cloud/named profiles.
+# 2026-10-08: raised from 180000 after a long review run compacted 34 times in 11.5 hours.
+# About 49,000 characters of instructions and tool schemas plus the runtime status message are
+# reserved first, so 180000 left a working window of roughly 115,000 characters (two or three child
+# reports per cycle), and every compaction cost a cache miss and a planner round. 300000 is about
+# 100,000 input tokens, well below the ~140,000-token prompts at which the 35B parent lost track of
+# its request earlier that day under the unlimited 552000 ceiling.
+parent_context_chars = 300000
+# Compact at 90% of the available message budget, after reserving output, tools and runtime state.
+# The parent uses the smaller parent_context_chars budget; children use the shared ceiling.
+# Retain recent complete exchanges up to 50% of the message budget, plus the summary and instructions.
+compaction_trigger_ratio = 0.90
+compaction_keep_ratio = 0.50
+# Handoff notes use a small, separate generation allowance.
+summary_max_tokens = 4096
+summary_reasoning_tokens = 512
+max_output_chars = 16000
+max_read_tools_per_round = 4
+# Default shell lifetime and minimum positive timeout for all command tools (60 minutes).
+# Explicit per-call 0 remains unlimited; shorter model-selected limits are raised to this value.
+command_timeout_seconds = 3600
+
+[delegation]
+enabled = true
+# Reassess delegation throughout substantial work; "balanced" makes checkpoints advisory.
+strategy = "aggressive"
+# A focused planner selects assignments; the runtime starts or queues them.
+assessment_enabled = true
+assessment_interval = 8
+assessment_max_tokens = 4096
+assessment_reasoning_tokens = 1024
+# Assess delegation before a read batch is expected to add this much text.
+preflight_read_chars = 8000
+max_active = 2
+# Finished children free slots for later assignments; zero means no lifetime turn quota.
+max_spawn_per_turn = 0
+max_steps = 0
+# Zero leaves child assignments without a time cutoff; positive values set an optional deadline.
+max_seconds = 0
+max_report_chars = 6000
+# Zero waits for child reports without a time cutoff; positive values bound final collection.
+final_wait_seconds = 0
+# Shared across the parent, children, and context summaries. Zero disables the cap.
+max_model_calls = 0
+# Match the parent model server's single generation slot on the MI50.
+# The library default remains 2; tests/test_delegation.py records this override.
+model_concurrency = 1
+# Independent worker server on P100 GPUs 0/1 (Qwen3.6-35B-A3B-GPU01); two active children share its one slot.
+subagent_model_concurrency = 1
+
+[model]
+base_url = "http://127.0.0.1:8080/v1"
+name = "Qwen3.8-27B"
+api_key_env = "LILLIA_API_KEY"
+# Match llama-swap's Q8/MTP server on the AMD MI50 (NUMA node 1) since 2026-09-26: ROCm 6.4 in the
+# container local/rocm-gfx906:forky-rocm6.4 (Vulkan/RADV until 22:14 that day; see
+# /opt/ai-stack/rocm-gfx906/README.md). -c 250000 --parallel 1 -kvu; the server pads the slot to 250,112.
+# Input, reasoning, and the answer share this window.
+context_window_tokens = 250000
+# Total generation allowance: reasoning and tool calls / final answer together.
+# Reserves 64000 output tokens plus a 2048-token margin, leaving an estimated
+# 551856 input characters, just below max_context_chars = 552000.
+max_tokens = 64000
+timeout_seconds = 0
+request_timeout_seconds = 0
+# Change to "max_completion_tokens" for providers that require it.
+token_parameter = "max_tokens"
+# Request reported token usage in the final streamed event.
+include_usage = true
+# Keep historical thinking in the journal, without replaying it in each request.
+replay_reasoning = false
+# Abort a streamed generation whose trailing 12,000 characters of reasoning have stopped carrying
+# language (a repetition loop, or raw hex/number enumeration), and classify a reasoning-only overrun
+# at the output limit the same way. Calibrated on every saved reasoning trace: genuine reasoning never
+# compressed below 0.247 or fell under 53 words per 1,000 characters in a 12,000-character window.
+# The defaults (compression 0.12, density 30, 1.6 characters per token) live in ModelConfig in
+# lillia/config.py and can be overridden here as degenerate_compression_ratio, degenerate_prose_density,
+# degenerate_chars_per_token and degenerate_window_chars. Setting this false disables both checks.
+degenerate_detection = true
+
+[model.extra_body]
+# -1 defers to the server's budget, which is now unlimited (no --reasoning-budget
+# in the llama-swap entry). Thinking is bounded only by max_tokens above, which
+# reasoning and the answer share, and by the context window. Summary and
+# delegation calls still pass their own smaller explicit budgets.
+reasoning_budget_tokens = -1
+
+[model.extra_body.chat_template_kwargs]
+enable_thinking = true
+
+[model.degenerate_retry_sampling]
+# Sent only on the retry that follows a degenerate generation; every other request keeps the
+# server's sampling. Qwen3 guidance recommends a presence penalty of 0-2 against endless repetition.
+# Accepted keys: temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty, repeat_penalty,
+# seed. top_k, min_p and repeat_penalty are llama.cpp extensions a strict OpenAI-compatible server
+# may reject with HTTP 400 (which would only fail that one retry).
+presence_penalty = 1.0
+
+[subagent_model]
+# Checked at startup through the same llama-swap gateway as the parent. This used to be
+# lillia-workers.service on :8091, an always-on unit holding GPUs 0/1; it is now disabled.
+# Since 2026-09-26 the gateway entry "Qwen3.6-35B-A3B-GPU01" runs the 35B fully on P100 GPUs 0/1
+# (NUMA node 0, -c 250000); until then "Qwen3.6-35B-A3B" ran it on GPU2 with the expert weights of
+# its first 28 layers in RAM. After its 900s idle TTL it can unload, then reload on the next child
+# request. The gateway's routing matrix allows this model alongside either MI50 parent and the
+# embedder, so child requests keep the parent loaded.
+base_url = "http://127.0.0.1:8080/v1"
+name = "Qwen3.6-35B-A3B-GPU01"
+api_key_env = "LILLIA_API_KEY"
+context_window_tokens = 250000
+max_tokens = 64000
+timeout_seconds = 0
+request_timeout_seconds = 0
+token_parameter = "max_tokens"
+include_usage = true
+replay_reasoning = false
+
+[subagent_model.extra_body]
+# No separate reasoning cap; reasoning and the answer share max_tokens.
+reasoning_budget_tokens = -1
+
+[subagent_model.extra_body.chat_template_kwargs]
+enable_thinking = true
+
+[web]
+# How Lillia identifies itself to web servers. Probed on 2026-09-20 against the hosts that
+# failed in the 2026-09-19/20 runs: en.wikipedia.org returns 403 for a bare "Lillia-Full/0.1"
+# AND for a current Chrome User-Agent, but 200 for any string carrying a parenthesised contact
+# URL. Spoofing a browser does not work; identifying yourself does. Point this at a page a site
+# operator could actually use to reach you. A bare email address is rejected -- write
+# "mailto:you@example.org" if you deliberately want to publish one.
+contact = "https://github.com/lillia-full/lillia-full"
+# Leave empty to build the User-Agent from `contact`; set it to override the whole string.
+user_agent = ""
+timeout_seconds = 3600
+# Retries cover the intermittent failures from the run: search.yahoo.com answered
+# "500 INKApi Error" on roughly one request in eight, and archive.org answered 429 once and
+# then 200 five times running. Only transient statuses (429, 5xx, Cloudflare 52x) and
+# transport errors are retried -- a 403 or 404 is a settled answer and is reported immediately.
+retry_attempts = 3
+retry_backoff_seconds = 1.0
+retry_max_sleep_seconds = 10.0
+# Tried in order until one returns real results. "brave" is the general index; "wikipedia" is
+# the MediaWiki API; "ddg" is the Instant Answer API, which is often empty and so goes last.
+# Bing's RSS view is deliberately absent: it returns HTTP 200 and well-formed items that match
+# only the query's first token, which is worse than an error because it looks like an answer.
+search_backends = ["brave", "wikipedia", "ddg"]
+search_max_results = 10
+
+[recovery]
+# Evidence-triggered advisory checkpoints, independent of delegation strategy.
+# These small reviewer budgets do not change the main worker's thinking allowance.
+enabled = true
+max_tokens = 2048
+reasoning_tokens = 256
+cooldown_tools = 6
+# Independent parent/child safeguard: warn, then checkpoint and finish partial after
+# sustained unchanged executed reads. New observations, completed experiments, and
+# newly passed criteria reduce accumulated repetition.
+# Applies even with enabled = false. Zero disables; positive values must be at least 12.
+read_loop_limit = 12
+
+[playbooks]
+# Reuse observed project procedures across tasks; old runs never certify current results.
+enabled = true
+max_results = 2
+max_context_chars = 3500
+max_entries_per_project = 100
+max_age_days = 90
+
+[outcome_review]
+# Review evidence-backed parent work, including one-observation answers. At most three review calls
+# (two outcomes plus one format correction) and one worker repair; unresolved results are partial.
+enabled = true
+max_tokens = 2048
+reasoning_tokens = 512
+max_context_chars = 24000
+timeout_seconds = 180
+
+[embedding_model]
+# Checked at startup through the llama-swap gateway, like the chat models. Since 2026-09-26 the
+# default layout uses "Qwen3-Embedding-8B-GPU2" on P100 GPU2 (NUMA node 1, FP32 cuBLAS); from
+# 2026-09-21 it used the CPU-only "Qwen3-Embedding-8B" entry, which now serves only Open WebUI RAG.
+# After its 900s idle TTL it can unload, then reload on the next embedding request.
+# CHANGED 2026-09-21: this used to be lillia-embeddings.service on :8092, an always-on
+# systemd unit. That service is now stopped and disabled; the gateway's "Qwen3-Embedding-8B"
+# entry serves the same GGUF. The gateway also serves Open WebUI's RAG from this one entry,
+# so there is a single CPU embedder rather than two. The same weights on GPU2 are the
+# "Qwen3-Embedding-8B-GPU2" entry, used by the [cloud] and [model_profiles] tables below.
+# Measured on this hardware with DISTINCT inputs at batch 16: 407.9 tok/s on GPU2 against
+# 47.5 tok/s for the same model CPU-only -- about 8.6x. (Benchmarking with repeated
+# identical inputs reports several times that, because the server's prompt cache serves
+# the repeats; those numbers are not real throughput.)
+# Setting enabled = false leaves search_evidence working with lexical (FTS5) recall only.
+enabled = true
+base_url = "http://127.0.0.1:8080/v1"
+name = "Qwen3-Embedding-8B-GPU2"
+# Keeps the stored vectors' identity (Qwen3-Embedding-8B@1024): same GGUF, pooling and width.
+index_model = "Qwen3-Embedding-8B"
+api_key_env = "LILLIA_API_KEY"
+# Qwen3-Embedding-8B is natively 4096-wide. Matryoshka truncation to 1024 measured 4/5
+# top-1 agreement with the full width on this codebase, at a quarter of the storage
+# (99 MB rather than 396 MB over the current 24,189-chunk corpus) and a quarter of the
+# scan cost -- width sets both linearly. The live per-vector scan cost at 1024 dims is
+# 58.2 us, measured against this index. Changing this value
+# invalidates every stored vector: run 'lillia index --rebuild' afterwards.
+dimensions = 1024
+batch_size = 32
+timeout_seconds = 0
+request_timeout_seconds = 0
+
+[retrieval]
+# search_evidence: lexical + vector recall over saved context artifacts.
+enabled = true
+# Before repeating earlier work, inject a bounded reminder and let the model reconsider.
+auto_recall = true
+# Incrementally index this session during a run, independently of search_evidence.
+continuous_indexing = true
+index_interval_seconds = 2.0
+index_batch_chunks = 4
+recall_max_results = 3
+recall_max_chars = 3500
+recall_timeout_seconds = 5.0
+recall_min_similarity = 0.65
+recall_cooldown_steps = 1
+chunk_chars = 1500
+chunk_overlap = 200
+max_results = 10
+# Vectors computed during a single search call while the backfill catches up. The bulk
+# work belongs to 'lillia index', which is deliberate and interruptible; a tool call must
+# not silently turn into a multi-hour embed.
+backfill_chunks_per_call = 128
+# Ceiling on the brute-force cosine scan, which is pure Python (no numpy dependency).
+max_scan_chunks = 40000
+# Compaction source archives measured 76% of artifact volume and re-serialize journal rows.
+# They stay indexed because read_artifact can reach them and nothing else can; identical
+# chunks are collapsed in the results rather than spending result slots twice.
+index_archives = true
+
+# ------------------------------------------------------------------------------------------------
+# Cloud profile, selected with `lillia --cloud` (or `./run.sh --cloud`). Nothing below applies
+# without that flag. Keys in a [cloud.X] table replace the same keys in [X] above; a nested table
+# such as extra_body replaces the whole table, so llama.cpp request fields never reach Ollama.
+# Everything not mentioned keeps its value from above (state directory, tools, recovery, limits).
+#
+# The parent and subagent models run on Ollama Cloud through the local Ollama daemon
+# (ollama.service on :11434). The daemon is signed in to the ollama.com account, and its cloud
+# generations draw on that subscription's usage; Lillia holds no cloud credential, so none is
+# visible to the commands the model runs. Startup and `doctor` print the account name and plan
+# (from the daemon's /api/me). A cloud model must be registered once on the daemon:
+# `ollama pull deepseek-v4.1-flash:cloud`. To bypass the daemon, use base_url = "https://ollama.com/v1",
+# names without ":cloud", and export OLLAMA_API_KEY (which the model's shell could then read).
+#
+# The embedder stays local: the gateway entry "Qwen3-Embedding-8B-GPU2" serves the same GGUF on
+# GPU2. The gateway's routing matrix keeps it available alongside either local layout, so cloud
+# sessions can share it without evicting local chat models. The two MI50 chat models swap each other.
+[cloud]
+# Keeps cloud steps at the pre-2026-09-26 input size (~83k tokens) rather than the local 552000.
+max_context_chars = 250000
+# Keep the cloud profile's existing compaction policy.
+compaction_trigger_ratio = 0.80
+compaction_keep_ratio = 0.3333333333333333
+
+[cloud.model]
+base_url = "http://127.0.0.1:11434/v1"
+# DeepSeek-V4.1-Flash (763B MoE, FP8): thinking, tools and vision, 1,048,576-token context.
+# $0.15 in / $0.003 cached / $0.60 out per 1M tokens, doubled 12:00-18:00 UTC on weekdays
+# (08:00-14:00 EDT). Parallel tool calls stream whole with distinct indices (measured).
+name = "deepseek-v4.1-flash:cloud"
+# Unused through the daemon unless exported; required only for https://ollama.com/v1.
+api_key_env = "OLLAMA_API_KEY"
+context_window_tokens = 1048576
+# Reasoning and the answer share this allowance, as locally; the cloud context no longer forces
+# the 64,000 local ceiling. Measured 2026-09-22: deepseek-v4.1-flash generated all 131,072
+# requested tokens and finished "length" at exactly this value (584 s). The no-action recovery
+# retries only a length finish that reaches max_tokens, so never exceed what the cloud serves:
+# measure a model's served cap before switching to it (glm-5.3-flash, for one, stops at 65,536).
+max_tokens = 131072
+# Seconds of silence tolerated between streamed chunks (0 would wait forever on a stalled
+# connection). Tool calls arrive whole, so a large file write is silent while it is generated:
+# through the daemon, an 18,935-token write_file argument streamed after 175 silent seconds
+# and completed normally. 900 seconds covers roughly 50,000 such tokens.
+timeout_seconds = 900
+request_timeout_seconds = 0
+# Sent for requests that ask for no reasoning (the startup probe, summary retries). DeepSeek
+# answers "none" cleanly (measured); GLM-5.3 instead wrote its thinking into the answer text and
+# needed "low" here, so check this whenever the model changes.
+zero_budget_effort = "none"
+
+[cloud.model.extra_body]
+# Ollama has no reasoning token budget; this is its thinking level, "max" being the highest it
+# documents. Summaries, assessments and recovery reviews that pass their own small budget are
+# sent "low" (lillia/provider.py reasoning_effort_for).
+reasoning_effort = "max"
+
+[cloud.subagent_model]
+base_url = "http://127.0.0.1:11434/v1"
+# MiniMax-M3: thinking, tools and vision, 512,000-token context. $0.60 in / $0.12 cached /
+# $2.40 out per 1M tokens. It numbers every parallel tool call index 0; the provider separates
+# them by id (measured, lillia/provider.py).
+name = "minimax-m3:cloud"
+api_key_env = "OLLAMA_API_KEY"
+context_window_tokens = 512000
+# Measured 2026-09-22: minimax-m3 generated 72,887 tokens uncut before stopping on its own, so
+# 65,536 is proven to be served. A larger value needs its own measurement, since length
+# recovery requires completion >= max_tokens.
+max_tokens = 65536
+timeout_seconds = 900
+request_timeout_seconds = 0
+# MiniMax answers "none" cleanly (measured).
+zero_budget_effort = "none"
+
+[cloud.subagent_model.extra_body]
+reasoning_effort = "max"
+
+[cloud.delegation]
+# Zero disables Lillia's active-child and generation concurrency limits. Both generation
+# gates are unlimited, including when parent and children use the same cloud model.
+# Ollama's account/service limits still apply; these settings do not bypass them.
+max_active = 0
+model_concurrency = 0
+subagent_model_concurrency = 0
+
+[cloud.embedding_model]
+# Gateway route to the same Qwen3-Embedding-8B weights, pooling and width on GPU2. index_model
+# keeps the stored vectors' identity (Qwen3-Embedding-8B@1024): GPU (FP32 cuBLAS) and CPU vectors
+# agree to cosine 0.9975 or better, so no rebuild.
+name = "Qwen3-Embedding-8B-GPU2"
+index_model = "Qwen3-Embedding-8B"
+batch_size = 32
+
+# ------------------------------------------------------------------------------------------------
+# Model placement profiles, selected with `lillia --model NAME` (or `./run.sh --model NAME`) by the
+# exact key NAME. Nothing below applies to any other --model value, to LILLIA_MODEL, or to a run
+# without --model. The overlay works like [cloud]: keys in [model_profiles."NAME".X] replace the same
+# keys in [X] above, and everything not mentioned keeps its value (context window, output limit,
+# uncapped reasoning, delegation, state directory). LILLIA_MODEL cannot replace the profile's parent,
+# because --model outranks it; the other LILLIA_* endpoint variables still win and startup warns.
+# A profile cannot be combined with --cloud.
+#
+# `--model Qwen3.6-35B`: "Qwen3.6-35B-A3B-MI50" runs the 35B on the 32 GB AMD MI50 through
+# the existing ROCm container: full GPU offload, Q8 KV, MTP, one 250,000-token slot for the parent.
+# Since 2026-10-08 the subagents use the P100 worker entry (its own slot) instead of sharing the
+# parent's gate; see [model_profiles."Qwen3.6-35B".subagent_model]. The explicit windows
+# below keep this profile at 250000 even if the default model's context changes.
+# The gateway's routing matrix swaps this model with Qwen3.8-27B on the same MI50, while keeping
+# the P100 worker and GPU2/CPU embedders available. Default and 35B sessions reload the MI50 model
+# when switching between them; avoid running both simultaneously.
+# The full ID Qwen3.6-35B-A3B and LILLIA_MODEL=Qwen3.6-35B still select the standalone GPU2 + RAM
+# entry, without this profile. Use the exact shortcut below to select the complete MI50 layout.
+[model_profiles."Qwen3.6-35B".model]
+name = "Qwen3.6-35B-A3B-MI50"
+context_window_tokens = 250000
+
+[model_profiles."Qwen3.6-35B".subagent_model]
+# 2026-10-08: children run on the P100 worker entry instead of the parent's MI50 slot. With both
+# roles on one slot, an 11.5-hour review run serialized every parent, child, planner and summary
+# generation through it and the parent waited six hours in the queue. The gateway's routing matrix
+# keeps this worker resident alongside the MI50 35B, so the two roles now generate concurrently
+# (subagent_model_concurrency = 1 on the worker's own slot); the worker decodes roughly 15% slower.
+name = "Qwen3.6-35B-A3B-GPU01"
+context_window_tokens = 250000
+
+[model_profiles."Qwen3.6-35B".embedding_model]
+# Same weights, pooling and width as the CPU entry; index_model keeps the stored vectors' identity
+# (Qwen3-Embedding-8B@1024), as in [cloud.embedding_model], so no rebuild.
+name = "Qwen3-Embedding-8B-GPU2"
+index_model = "Qwen3-Embedding-8B"
+batch_size = 32
+
+[model_profiles."Qwen3.6-35B".retrieval]
+# GPU settings, as above; restated so the profile does not depend on a base file's CPU tuning.
+backfill_chunks_per_call = 128
+recall_timeout_seconds = 5.0
